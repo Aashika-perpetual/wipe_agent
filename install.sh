@@ -50,4 +50,4 @@ sudo systemctl enable pc_wipe_agent.service
 sudo systemctl start pc_wipe_agent.service
 
 echo "[INFO] Installation complete."
-echo "[INFO] Agent is running at: http://0.0.0.0:5050"
+echo "[INFO] Agent is running at: http://0.0.0.0:5055"

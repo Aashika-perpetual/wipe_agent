@@ -16,21 +16,19 @@ def delete_contents(path):
         for name in files:
             fp = os.path.join(root, name)
             try:
-                os.chmod(fp, 0o777)    # force writable
+                os.chmod(fp, 0o777)
                 os.unlink(fp)
             except Exception as e:
                 print(f"[DEL] Failed {fp}: {e}")
         for name in dirs:
             try:
                 shutil.rmtree(os.path.join(root, name))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DEL DIR] Failed {os.path.join(root, name)}: {e}")
 
 def wipe_worker(path, method):
     thread_id = threading.get_ident()
     stop_event = threading.Event()
-
-    # Use a unique temporary file per thread
     wipe_file = os.path.join(path, f".wipe_fill_{thread_id}.bin")
 
     with wipes_lock:
@@ -43,20 +41,19 @@ def wipe_worker(path, method):
 
     print(f"[WIPE {thread_id}] Starting → {path} | Method: {method}")
 
-    # Step 1: Delete all files/folders
+    # Step 1: Delete everything
     delete_contents(path)
 
     # Step 2: Fill free space
     try:
         usage = psutil.disk_usage(path)
         total_free = usage.free
-        block_size = 256 * 1024 * 1024  # 256 MB chunks = faster + safer
+        block_size = 256 * 1024 * 1024
         written = 0
 
-        with open(wipe_file, "wb", buffering=0) as f:  # unbuffered = real disk write
+        with open(wipe_file, "wb", buffering=0) as f:
             while written < total_free and not stop_event.is_set():
-                remaining = total_free - written
-                chunk = min(block_size, remaining)
+                chunk = min(block_size, total_free - written)
 
                 if method == "zero":
                     f.write(b"\x00" * chunk)
@@ -70,14 +67,12 @@ def wipe_worker(path, method):
                     if thread_id in active_wipes:
                         active_wipes[thread_id]["progress"] = progress
 
-        status = "Stopped" if stop_event.is_set() else "Completed"
-        print(f"[WIPE {thread_id}] {status}")
+        print(f"[WIPE {thread_id}] {'Stopped' if stop_event.is_set() else 'Completed'}")
 
     except Exception as e:
         print(f"[WIPE {thread_id}] ERROR: {e}")
 
     finally:
-        # Always delete the fill file
         try:
             if os.path.exists(wipe_file):
                 os.remove(wipe_file)
@@ -100,9 +95,8 @@ def status():
         any_active = len(active_wipes) > 0
         progress = 0
         if any_active:
-            # Average progress of all running wipes
-            progresses = [info["progress"] for info in active_wipes.values()]
-            progress = sum(progresses) // len(progresses)
+            progresses = [v["progress"] for v in active_wipes.values()]
+            progress = sum(progresses) // len(progresses) if progresses else 0
 
     return jsonify({
         "status": "online",
@@ -146,9 +140,6 @@ def wipe():
     if not path:
         return jsonify({"error": "Missing device path"}), 400
 
-    # Do NOT check os.path.exists() here — many mounts are lazy or need root delay
-    # Just start the thread — it will fail gracefully if path is wrong
-
     thread = threading.Thread(target=wipe_worker, args=(path, method), daemon=False)
     thread.start()
 
@@ -170,17 +161,13 @@ def emergency_stop():
             info["stop_flag"].set()
             stopped += 1
 
-    return jsonify({
-        "status": "stopping",
-        "stopped_wipes": stopped
-    })
+    return jsonify({"status": "stopping", "stopped_wipes": stopped})
 
 
 if __name__ == "__main__":
     print("==========================================")
-    print(" PC WIPE AGENT – FIXED & RELIABLE")
-    print(" Works perfectly with your current Android app")
-    print(" No leftover files | Real progress | Multi-wipe safe")
-    print(" Listening → http://0.0.0.0:5050")
+    print(" PC WIPE AGENT – FINAL VERSION")
+    print(" Port: 5055")
+    print(" Fully working • No leftover files • Multi-PC safe")
     print("==========================================")
-    app.run(host="0.0.0.0", port=5050, threaded=True)
+    app.run(host="0.0.0.0", port=5055, threaded=True)

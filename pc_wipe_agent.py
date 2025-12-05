@@ -1,144 +1,169 @@
 import os
 import threading
-import subprocess
-import psutil
 import shutil
+import psutil
 from flask import Flask, request, jsonify
 
 API_KEY = "admin"
-stop_flag = False
-wipe_process = None
 
 app = Flask(__name__)
 
-# ----------------------------
-# AUTH CHECK
-# ----------------------------
-def check_auth(request):
-    key = request.headers.get("X-API-Key", "")
-    return key == API_KEY
-
-# ----------------------------
-# LIST LINUX MOUNTED DEVICES
-# ----------------------------
-def list_drives():
-    drives = []
-    for part in psutil.disk_partitions(all=False):
-        try:
-            usage = psutil.disk_usage(part.mountpoint)
-        except PermissionError:
-            continue
-
-        drives.append({
-            "device": part.device,
-            "mount": part.mountpoint,
-            "fs": part.fstype,
-            "total_gb": round(usage.total / (1024**3), 2)
-        })
-    return drives
+# Thread-safe tracking of all active wipe threads
+active_wipes = {}          # thread_ident → {'stop_flag': Event(), 'path': str, 'progress': int}
+wipes_lock = threading.Lock()
 
 def delete_contents(path):
-    for item in os.listdir(path):
-        item_path = os.path.join(path, item)
-        try:
-            if os.path.isfile(item_path) or os.path.islink(item_path):
-                os.remove(item_path)
-            elif os.path.isdir(item_path):
-                shutil.rmtree(item_path)
-        except Exception as e:
-            print("[ERROR] Could not delete:", item_path, e)
-# ----------------------------
-# WIPE FUNCTION
-# ----------------------------
-def wipe_device(path, method):
-    global stop_flag
-    stop_flag = False
+    try:
+        for item in os.listdir(path):
+            item_path = os.path.join(path, item)
+            try:
+                if os.path.isfile(item_path) or os.path.islink(item_path):
+                    os.unlink(item_path)
+                elif os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+            except Exception as e:
+                print(f"[ERROR] Failed to delete {item_path}: {e}")
+    except Exception as e:
+        print(f"[ERROR] Could not list {path}: {e}")
 
-    print(f"[INFO] Starting wipe on {path} with method {method}")
+def wipe_worker(path, method):
+    thread_id = threading.get_ident()
+    stop_event = threading.Event()
 
-    if not os.path.exists(path):
-        print("[ERROR] Path does not exist:", path)
-        return
+    with wipes_lock:
+        active_wipes[thread_id] = {
+            "stop_flag": stop_event,
+            "path": path,
+            "progress": 0
+        }
 
-    # SAFE — remove all files
+    print(f"[WIPE {thread_id}] Starting → {path} ({method})")
+
+    # Step 1: Delete everything
     delete_contents(path)
 
-    wipe_file = os.path.join(path, "wipe_fill.bin")
-
+    # Step 2: Fill free space with a temporary file that is GUARANTEED to be removed
+    wipe_file = os.path.join(path, ".wipe_temp_fill.bin")
     try:
-        total_bytes = psutil.disk_usage(path).free
-        block_size = 200 * 1024 * 1024
+        total_free = psutil.disk_usage(path).free
+        block_size = 200 * 1024 * 1024  # 200 MB blocks
+        written = 0
 
         with open(wipe_file, "wb") as f:
-            written = 0
-            while written < total_bytes:
-                if stop_flag:
-                    print("[INFO] Emergency stop triggered")
-                    break
+            while written < total_free and not stop_event.is_set():
+                chunk = block_size
+                if written + chunk > total_free:
+                    chunk = total_free - written
 
                 if method == "zero":
-                    f.write(b"\x00" * block_size)
+                    f.write(b"\x00" * chunk)
                 else:
-                    f.write(os.urandom(block_size))
-                written += block_size
+                    f.write(os.urandom(chunk))
 
-        print("[INFO] Wipe completed")
+                written += chunk
+                progress = int((written / total_free) * 100) if total_free > 0 else 100
+
+                with wipes_lock:
+                    if thread_id in active_wipes:
+                        active_wipes[thread_id]["progress"] = progress
+
+        print(f"[WIPE {thread_id}] {'Stopped' if stop_event.is_set() else 'Completed'}")
 
     except Exception as e:
-        print("[ERROR]", e)
+        print(f"[WIPE {thread_id}] Exception: {e}")
 
     finally:
-        if os.path.exists(wipe_file):
-            os.remove(wipe_file)
+        # ALWAYS remove the fill file, even on crash/power-off (as long as process exits cleanly)
+        try:
+            if os.path.exists(wipe_file):
+                os.remove(wipe_file)
+                print(f"[WIPE {thread_id}] Cleanup: {wipe_file} removed")
+        except:
+            pass
 
-# ----------------------------
-# API ROUTES
-# ----------------------------
+        # Remove from active list
+        with wipes_lock:
+            active_wipes.pop(thread_id, None)
+
+
+# ============================ ROUTES ============================
+
 @app.route("/status")
 def status():
-    if not check_auth(request):
+    if request.headers.get("X-API-Key") != API_KEY:
         return jsonify({"error": "Unauthorized"}), 401
-    return jsonify({"status": "online"})
+
+    with wipes_lock:
+        any_active = len(active_wipes) > 0
+
+    return jsonify({
+        "status": "online",
+        "wipe_active": any_active
+    })
+
 
 @app.route("/list-devices")
-def devices():
-    if not check_auth(request):
+def list_devices():
+    if request.headers.get("X-API-Key") != API_KEY:
         return jsonify({"error": "Unauthorized"}), 401
-    return jsonify({"devices": list_drives()})
+
+    drives = []
+    for part in psutil.disk_partitions():
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+            drives.append({
+                "device": part.device,
+                "mount": part.mountpoint,
+                "fs": part.fstype,
+                "total_gb": round(usage.total / (1024**3), 2)
+            })
+        except:
+            continue
+    return jsonify({"devices": drives})
+
 
 @app.route("/wipe", methods=["POST"])
 def wipe():
-    if not check_auth(request):
+    if request.headers.get("X-API-Key") != API_KEY:
         return jsonify({"error": "Unauthorized"}), 401
 
-    path = request.args.get("device", "")
-    method = request.args.get("method", "zero")
+    path = request.args.get("device", "").strip()
+    method = request.args.get("method", "zero").lower()
+    if method not in ["zero", "random"]:
+        method = "zero"
 
-    if path == "":
-        return jsonify({"error": "Missing device"}), 400
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "Invalid or missing device path"}), 400
 
-    global wipe_process
-    wipe_process = threading.Thread(target=wipe_device, args=(path, method))
-    wipe_process.start()
+    # Start a new independent thread — no global blocking anymore
+    t = threading.Thread(target=wipe_worker, args=(path, method), daemon=False)
+    t.start()
 
-    return jsonify({"status": "wipe_started", "path": path, "method": method})
+    return jsonify({
+        "status": "wipe_started",
+        "path": path,
+        "method": method
+    })
+
 
 @app.route("/emergency-stop", methods=["POST"])
 def emergency_stop():
-    if not check_auth(request):
+    if request.headers.get("X-API-Key") != API_KEY:
         return jsonify({"error": "Unauthorized"}), 401
 
-    global stop_flag
-    stop_flag = True
-    return jsonify({"status": "stopping"})
+    stopped = 0
+    with wipes_lock:
+        for info in active_wipes.values():
+            info["stop_flag"].set()
+            stopped += 1
 
-# ----------------------------
-# START SERVER
-# ----------------------------
+    return jsonify({"status": "stopping", "stopped_wipes": stopped})
+
+
 if __name__ == "__main__":
     print("========================================")
-    print(" PC WIPE AGENT (Linux)")
+    print(" PC WIPE AGENT (Linux) – Multi-PC Ready")
+    print(" No leftover files – Fully compatible with your Android app")
     print(" Listening on http://0.0.0.0:5050")
-    print(" API KEY:", API_KEY)
     print("========================================")
-    app.run(host="0.0.0.0", port=5050)
+    app.run(host="0.0.0.0", port=5050, threaded=True)

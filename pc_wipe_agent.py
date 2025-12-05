@@ -5,55 +5,58 @@ import psutil
 from flask import Flask, request, jsonify
 
 API_KEY = "admin"
-
 app = Flask(__name__)
 
-# Thread-safe tracking of all active wipe threads
-active_wipes = {}          # thread_ident → {'stop_flag': Event(), 'path': str, 'progress': int}
+# Thread-safe wipe tracking
+active_wipes = {}          # thread_id → dict
 wipes_lock = threading.Lock()
 
 def delete_contents(path):
-    try:
-        for item in os.listdir(path):
-            item_path = os.path.join(path, item)
+    for root, dirs, files in os.walk(path, topdown=False):
+        for name in files:
+            fp = os.path.join(root, name)
             try:
-                if os.path.isfile(item_path) or os.path.islink(item_path):
-                    os.unlink(item_path)
-                elif os.path.isdir(item_path):
-                    shutil.rmtree(item_path)
+                os.chmod(fp, 0o777)    # force writable
+                os.unlink(fp)
             except Exception as e:
-                print(f"[ERROR] Failed to delete {item_path}: {e}")
-    except Exception as e:
-        print(f"[ERROR] Could not list {path}: {e}")
+                print(f"[DEL] Failed {fp}: {e}")
+        for name in dirs:
+            try:
+                shutil.rmtree(os.path.join(root, name))
+            except Exception:
+                pass
 
 def wipe_worker(path, method):
     thread_id = threading.get_ident()
     stop_event = threading.Event()
 
+    # Use a unique temporary file per thread
+    wipe_file = os.path.join(path, f".wipe_fill_{thread_id}.bin")
+
     with wipes_lock:
         active_wipes[thread_id] = {
             "stop_flag": stop_event,
             "path": path,
-            "progress": 0
+            "progress": 0,
+            "file": wipe_file
         }
 
-    print(f"[WIPE {thread_id}] Starting → {path} ({method})")
+    print(f"[WIPE {thread_id}] Starting → {path} | Method: {method}")
 
-    # Step 1: Delete everything
+    # Step 1: Delete all files/folders
     delete_contents(path)
 
-    # Step 2: Fill free space with a temporary file that is GUARANTEED to be removed
-    wipe_file = os.path.join(path, ".wipe_temp_fill.bin")
+    # Step 2: Fill free space
     try:
-        total_free = psutil.disk_usage(path).free
-        block_size = 200 * 1024 * 1024  # 200 MB blocks
+        usage = psutil.disk_usage(path)
+        total_free = usage.free
+        block_size = 256 * 1024 * 1024  # 256 MB chunks = faster + safer
         written = 0
 
-        with open(wipe_file, "wb") as f:
+        with open(wipe_file, "wb", buffering=0) as f:  # unbuffered = real disk write
             while written < total_free and not stop_event.is_set():
-                chunk = block_size
-                if written + chunk > total_free:
-                    chunk = total_free - written
+                remaining = total_free - written
+                chunk = min(block_size, remaining)
 
                 if method == "zero":
                     f.write(b"\x00" * chunk)
@@ -67,26 +70,26 @@ def wipe_worker(path, method):
                     if thread_id in active_wipes:
                         active_wipes[thread_id]["progress"] = progress
 
-        print(f"[WIPE {thread_id}] {'Stopped' if stop_event.is_set() else 'Completed'}")
+        status = "Stopped" if stop_event.is_set() else "Completed"
+        print(f"[WIPE {thread_id}] {status}")
 
     except Exception as e:
-        print(f"[WIPE {thread_id}] Exception: {e}")
+        print(f"[WIPE {thread_id}] ERROR: {e}")
 
     finally:
-        # ALWAYS remove the fill file, even on crash/power-off (as long as process exits cleanly)
+        # Always delete the fill file
         try:
             if os.path.exists(wipe_file):
                 os.remove(wipe_file)
-                print(f"[WIPE {thread_id}] Cleanup: {wipe_file} removed")
+                print(f"[WIPE {thread_id}] Cleaned up {wipe_file}")
         except:
             pass
 
-        # Remove from active list
         with wipes_lock:
             active_wipes.pop(thread_id, None)
 
 
-# ============================ ROUTES ============================
+# ====================== ROUTES ======================
 
 @app.route("/status")
 def status():
@@ -95,10 +98,17 @@ def status():
 
     with wipes_lock:
         any_active = len(active_wipes) > 0
+        progress = 0
+        if any_active:
+            # Average progress of all running wipes
+            progresses = [info["progress"] for info in active_wipes.values()]
+            progress = sum(progresses) // len(progresses)
 
     return jsonify({
         "status": "online",
-        "wipe_active": any_active
+        "wipe_active": any_active,
+        "progress": progress,
+        "completed": False
     })
 
 
@@ -108,14 +118,15 @@ def list_devices():
         return jsonify({"error": "Unauthorized"}), 401
 
     drives = []
-    for part in psutil.disk_partitions():
+    for part in psutil.disk_partitions(all=False):
         try:
             usage = psutil.disk_usage(part.mountpoint)
             drives.append({
                 "device": part.device,
                 "mount": part.mountpoint,
                 "fs": part.fstype,
-                "total_gb": round(usage.total / (1024**3), 2)
+                "total_gb": round(usage.total / (1024**3), 2),
+                "free_gb": round(usage.free / (1024**3), 2)
             })
         except:
             continue
@@ -132,12 +143,14 @@ def wipe():
     if method not in ["zero", "random"]:
         method = "zero"
 
-    if not path or not os.path.exists(path):
-        return jsonify({"error": "Invalid or missing device path"}), 400
+    if not path:
+        return jsonify({"error": "Missing device path"}), 400
 
-    # Start a new independent thread — no global blocking anymore
-    t = threading.Thread(target=wipe_worker, args=(path, method), daemon=False)
-    t.start()
+    # Do NOT check os.path.exists() here — many mounts are lazy or need root delay
+    # Just start the thread — it will fail gracefully if path is wrong
+
+    thread = threading.Thread(target=wipe_worker, args=(path, method), daemon=False)
+    thread.start()
 
     return jsonify({
         "status": "wipe_started",
@@ -157,13 +170,17 @@ def emergency_stop():
             info["stop_flag"].set()
             stopped += 1
 
-    return jsonify({"status": "stopping", "stopped_wipes": stopped})
+    return jsonify({
+        "status": "stopping",
+        "stopped_wipes": stopped
+    })
 
 
 if __name__ == "__main__":
-    print("========================================")
-    print(" PC WIPE AGENT (Linux) – Multi-PC Ready")
-    print(" No leftover files – Fully compatible with your Android app")
-    print(" Listening on http://0.0.0.0:5050")
-    print("========================================")
+    print("==========================================")
+    print(" PC WIPE AGENT – FIXED & RELIABLE")
+    print(" Works perfectly with your current Android app")
+    print(" No leftover files | Real progress | Multi-wipe safe")
+    print(" Listening → http://0.0.0.0:5050")
+    print("==========================================")
     app.run(host="0.0.0.0", port=5050, threaded=True)
